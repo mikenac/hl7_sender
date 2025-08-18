@@ -9,8 +9,11 @@ RUN apt-get update && \
 RUN pip install uv
 
 # Copy source code
-COPY streamlit_sender.py . 
-COPY pyproject.toml .
+RUN ["mkdir", "-p", "/app"]
+COPY app.py /app
+COPY pyproject.toml /app
+
+WORKDIR /app
 
 # Install dependencies using uv
 RUN uv sync
@@ -19,4 +22,4 @@ RUN uv sync
 EXPOSE 8501
 
 # Run the server
-CMD ["uv", "run", "streamlit", "run", "streamlit_sender.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["uv", "run", "streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
