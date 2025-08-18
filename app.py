@@ -12,8 +12,8 @@ def load_config():
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, 'r') as f:
             config = json.load(f)
-        return config.get('HOST', '127.0.0.1'), config.get('PORT', 2575)
-    return '127.0.0.1', 2575
+        return config.get('HOST', 'host.docker.internal'), config.get('PORT', 2575)
+    return 'host.docker.internal', 2575
 
 def save_config(host, port):
     with open(CONFIG_PATH, 'w') as f:
