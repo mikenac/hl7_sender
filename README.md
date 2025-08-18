@@ -12,7 +12,7 @@ This repository allows you to send HL7 messages with ease. It includes a Streaml
 To start the Streamlit UI locally, run:
 
 ```bash
-streamlit run streamlit_sender.py
+streamlit run app.py
 ```
 
 ### Docker
@@ -28,3 +28,6 @@ To run the Docker container (with config.json persisted):
 ```bash
 make run
 ```
+
+Also available on DockerHub:
+``` docker pull mnacey/hl7_sender ```
