@@ -54,7 +54,7 @@ st.title("\U0001F4E4 HL7 MLLP Test Sender")
 default_host, default_port = load_config()
 col1, col2 = st.columns([1, 1])
 host = col1.text_input("Target Host", default_host)
-port = col2.number_input("Target Port", int(default_port))
+port = col2.number_input("Target Port", value= int(default_port))
 
 if st.button("Save Host/Port as Default"):
     save_config(host, int(port))
