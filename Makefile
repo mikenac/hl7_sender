@@ -1,6 +1,6 @@
 # Makefile for HL7 Sender
 
-IMAGE_NAME=hl7_sender
+IMAGE_NAME=teletracking/hl7_sender
 TAG=latest
 
 .PHONY: build run
