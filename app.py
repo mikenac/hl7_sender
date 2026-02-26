@@ -140,7 +140,7 @@ col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
 host = col1.text_input("Target Host", default_host)
 port = col2.number_input("Target Port", value=int(default_port), step=1)
 repeat_count = col3.number_input("Repeat Count", min_value=1, value=1, step=1)
-delay_minutes = col4.number_input("Delay Between Sends (minutes)", min_value=0, value=0, step=0.1)
+delay_minutes = col4.number_input("Delay Between Sends (minutes)", min_value=0.0, value=0.0, step=0.1)
 generate_message_id = st.checkbox(
     "Generate unique message control ID (MSH-10) per send",
     value=False,
