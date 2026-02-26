@@ -136,10 +136,11 @@ if "metrics_history" not in st.session_state:
     st.session_state["metrics_history"] = []
 
 default_host, default_port = load_config()
-col1, col2, col3 = st.columns([1, 1, 1])
+col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
 host = col1.text_input("Target Host", default_host)
 port = col2.number_input("Target Port", value=int(default_port), step=1)
 repeat_count = col3.number_input("Repeat Count", min_value=1, value=1, step=1)
+delay_minutes = col4.number_input("Delay Between Sends (minutes)", min_value=0, value=0, step=0.1)
 generate_message_id = st.checkbox(
     "Generate unique message control ID (MSH-10) per send",
     value=False,
@@ -197,6 +198,10 @@ if st.button("Send HL7 Message"):
                         "duration": attempt_duration
                     })
                     per_attempt_durations.append(attempt_duration)
+
+                    # Add delay between sends if not the last attempt
+                    if attempt < int(repeat_count) and delay_minutes > 0:
+                        time.sleep(delay_minutes * 60)
                 if error_message:
                     break
         batch_end_time = time.perf_counter()
