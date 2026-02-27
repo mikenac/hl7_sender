@@ -3,6 +3,7 @@ import socket
 import json
 import os
 import time
+import math
 import pandas as pd
 import uuid
 
@@ -128,22 +129,52 @@ def build_fake_ack(message: str, message_id: str | None):
         f"MSA{field_sep}AA{field_sep}{control_id}\r"
     )
 
+def build_summary_rows(records, show_cycle):
+    """Build summary table rows from ACK records."""
+    rows = []
+    for record in records:
+        preview = record["ack"].replace("\r", "\\r")
+        s = parse_ack_status(record["ack"])
+        label = {"AA": "\u2705 AA (Accept)", "AE": "\u26a0\ufe0f AE (Error)",
+                 "AR": "\u274c AR (Reject)"}.get(s, "\u26a0\ufe0f Unknown")
+        row = {"Message": record["message_idx"], "Attempt": record["attempt"],
+               "MSH-10": record["message_id"] or "", "Status": label,
+               "ACK Preview": (preview[:120] + "\u2026") if len(preview) > 120 else preview}
+        if show_cycle:
+            row = {"Cycle": record["cycle"], **row}
+        rows.append(row)
+    return rows
+
 # --- Streamlit UI ---
 st.set_page_config(page_title="HL7 MLLP Test Sender", layout="wide")
 st.title("\U0001F4E4 HL7 MLLP Test Sender")
 
 if "metrics_history" not in st.session_state:
     st.session_state["metrics_history"] = []
+if "send_results" not in st.session_state:
+    st.session_state["send_results"] = None
 
 default_host, default_port = load_config()
-col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+col1, col2, col3 = st.columns([1, 1, 1])
 host = col1.text_input("Target Host", default_host)
 port = col2.number_input("Target Port", value=int(default_port), step=1)
-repeat_count = col3.number_input("Repeat Count", min_value=1, value=1, step=1)
-delay_minutes = col4.number_input("Delay Between Sends (minutes)", min_value=0.0, value=0.0, step=0.1)
+repeat_count = col3.number_input("Repeat Count", min_value=1, value=1, step=1,
+                                  help="Number of times to send each message per cycle.")
+
+scol1, scol2 = st.columns(2)
+interval_minutes = scol1.number_input("Send Every (minutes)", min_value=0.0, value=0.0, step=0.5,
+                                       help="Interval between send cycles. 0 = one-shot (no scheduling).")
+duration_minutes = scol2.number_input("For Duration (minutes)", min_value=0.0, value=0.0, step=1.0,
+                                       help="Total time to keep sending. 0 = one-shot.")
+
+scheduled_mode = interval_minutes > 0 and duration_minutes > 0
+if scheduled_mode:
+    total_cycles = math.floor(duration_minutes / interval_minutes) + 1
+    st.info(f"Will send every {interval_minutes} min for {duration_minutes} min — **{total_cycles} cycles** "
+            f"({total_cycles * int(repeat_count)} total send(s) per message).")
 generate_message_id = st.checkbox(
     "Generate unique message control ID (MSH-10) per send",
-    value=False,
+    value=True,
     help="When enabled, each send attempt gets a new MSH-10."
 )
 simulate_ack = st.checkbox(
@@ -160,8 +191,6 @@ hl7_input = st.text_area("HL7 Message", height=300, placeholder="Paste your HL7 
 uploaded_file = st.file_uploader("Or upload HL7 text file", type=["txt", "hl7"], accept_multiple_files=False)
 
 if st.button("Send HL7 Message"):
-    batch_start_time = time.perf_counter()
-    per_attempt_durations = []
     file_content = ""
     if uploaded_file:
         file_content = uploaded_file.getvalue().decode("utf-8", errors="replace")
@@ -171,9 +200,36 @@ if st.button("Send HL7 Message"):
     if not hl7_messages:
         st.warning("Please provide a valid HL7 message via text or file upload.")
     else:
-        ack_records = []
-        error_message = None
-        with st.spinner(f"Sending message {int(repeat_count)} time(s)..."):
+        num_cycles = math.floor(duration_minutes / interval_minutes) + 1 if scheduled_mode else 1
+        results = {
+            "ack_records": [],
+            "per_attempt_durations": [],
+            "batch_start_time": time.perf_counter(),
+            "batch_end_time": None,
+            "num_cycles": num_cycles,
+            "num_messages": len(hl7_messages),
+            "repeat_count": int(repeat_count),
+            "error_message": None,
+            "cancelled": False,
+        }
+        st.session_state["send_results"] = results
+
+        status_placeholder = st.empty()
+        stop_placeholder = st.empty()
+        live_table_placeholder = st.empty() if scheduled_mode else None
+
+        if scheduled_mode:
+            stop_placeholder.button("Stop Sending", key="stop_btn", type="secondary")
+
+        for cycle in range(1, num_cycles + 1):
+            if scheduled_mode:
+                status_placeholder.info(
+                    f"Cycle {cycle}/{num_cycles} — "
+                    f"sending {len(hl7_messages)} message(s) x {int(repeat_count)} repeat(s)..."
+                )
+            else:
+                status_placeholder.info(f"Sending {len(hl7_messages)} message(s) x {int(repeat_count)} repeat(s)...")
+
             for msg_idx, message in enumerate(hl7_messages, start=1):
                 for attempt in range(1, int(repeat_count) + 1):
                     attempt_start = time.perf_counter()
@@ -188,97 +244,114 @@ if st.button("Send HL7 Message"):
                         ack = send_hl7_message(message_to_send, host, int(port))
                     attempt_duration = time.perf_counter() - attempt_start
                     if ack.startswith("Error:"):
-                        error_message = f"Message {msg_idx}, Attempt {attempt}: {ack}"
+                        results["error_message"] = f"Cycle {cycle}, Message {msg_idx}, Attempt {attempt}: {ack}"
                         break
-                    ack_records.append({
+                    results["ack_records"].append({
+                        "cycle": cycle,
                         "message_idx": msg_idx,
                         "attempt": attempt,
                         "ack": ack,
                         "message_id": message_id,
                         "duration": attempt_duration
                     })
-                    per_attempt_durations.append(attempt_duration)
-
-                    # Add delay between sends if not the last attempt
-                    if attempt < int(repeat_count) and delay_minutes > 0:
-                        time.sleep(delay_minutes * 60)
-                if error_message:
+                    results["per_attempt_durations"].append(attempt_duration)
+                if results["error_message"]:
                     break
-        batch_end_time = time.perf_counter()
+            if results["error_message"]:
+                break
 
-        if ack_records:
-            attempts_info = f"Sent {len(ack_records)} message attempt(s) successfully."
-            total_expected = len(hl7_messages) * int(repeat_count)
-            if total_expected > len(ack_records):
-                attempts_info += " Stopped early due to an error."
-            st.info(attempts_info)
+            # Update live results table after each cycle
+            if live_table_placeholder and results["ack_records"]:
+                live_table_placeholder.dataframe(
+                    build_summary_rows(results["ack_records"], show_cycle=True),
+                    hide_index=True, use_container_width=True, height=240)
 
-            last_ack = ack_records[-1]["ack"]
-            last_message_id = ack_records[-1]["message_id"]
-            status = parse_ack_status(last_ack)
-            if status == "AA":
-                st.success("\u2705 ACK Status: AA (Application Accept)")
-            elif status == "AE":
-                st.error("\u274c ACK Status: AE (Application Error)")
-            elif status == "AR":
-                st.error("\u274c ACK Status: AR (Application Reject)")
-            else:
-                st.warning(f"\u26a0\ufe0f Unknown ACK status: {status}")
-            if last_message_id:
-                st.info(f"Last sent Message Control ID (MSH-10): {last_message_id}")
+            # Wait for next cycle if not the last one
+            if scheduled_mode and cycle < num_cycles:
+                wait_seconds = interval_minutes * 60
+                wait_end = time.perf_counter() + wait_seconds
+                while time.perf_counter() < wait_end:
+                    remaining = wait_end - time.perf_counter()
+                    mins, secs = divmod(int(remaining), 60)
+                    status_placeholder.info(
+                        f"Cycle {cycle}/{num_cycles} complete — "
+                        f"next send in {mins}:{secs:02d}"
+                    )
+                    time.sleep(min(1.0, remaining))
 
-            header_suffix = " (Last Attempt)" if int(repeat_count) > 1 else ""
-            st.subheader(f"\U0001F4C4 Raw ACK Message{header_suffix}")
-            st.code(last_ack, language="hl7")
+        status_placeholder.empty()
+        stop_placeholder.empty()
+        if live_table_placeholder:
+            live_table_placeholder.empty()
+        results["batch_end_time"] = time.perf_counter()
 
-            st.subheader(f"\U0001F4C4 Parsed ACK Segments{header_suffix}")
-            segments = last_ack.strip().split("\r")
-            for segment in segments:
-                st.text(segment)
+# --- Display results from session state ---
+results = st.session_state.get("send_results")
+if results and results["ack_records"]:
+    ack_records = results["ack_records"]
+    per_attempt_durations = results["per_attempt_durations"]
+    num_cycles = results["num_cycles"]
+    rpt = results["repeat_count"]
+    batch_end = results["batch_end_time"] or time.perf_counter()
+    cancelled = results["batch_end_time"] is None
 
-            if int(repeat_count) > 1 or len(hl7_messages) > 1:
-                st.subheader("\U0001F4CA ACK Summary")
-                summary_rows = []
-                had_failures = False
-                for record in ack_records:
-                    preview = record["ack"].replace("\r", "\\r")
-                    status = parse_ack_status(record["ack"])
-                    status_label = {
-                        "AA": "\u2705 AA (Accept)",
-                        "AE": "\u26a0\ufe0f AE (Error)",
-                        "AR": "\u274c AR (Reject)"
-                    }.get(status, "\u26a0\ufe0f Unknown")
-                    if status != "AA":
-                        had_failures = True
-                    summary_rows.append({
-                        "Message": record["message_idx"],
-                        "Attempt": record["attempt"],
-                        "MSH-10": record["message_id"] or "",
-                        "Status": status_label,
-                        "ACK Preview": (preview[:120] + "…") if len(preview) > 120 else preview
-                    })
-                st.dataframe(summary_rows, hide_index=True, use_container_width=True, height=240)
-                if had_failures:
-                    st.warning("Some ACKs indicate errors or rejects. Check the summary and raw ACK for details.")
+    total_expected = results["num_messages"] * rpt * num_cycles
+    attempts_info = f"Sent {len(ack_records)} message attempt(s) successfully."
+    if cancelled:
+        attempts_info += " Cancelled by user."
+    elif total_expected > len(ack_records):
+        attempts_info += " Stopped early due to an error."
+    st.info(attempts_info)
 
-            total_attempts = len(ack_records)
-            total_elapsed = max(batch_end_time - batch_start_time, 0)
-            messages_per_sec = (total_attempts / total_elapsed) if total_elapsed > 0 else 0
-            avg_time_ms = (sum(per_attempt_durations) / total_attempts * 1000) if total_attempts else 0
+    last_ack = ack_records[-1]["ack"]
+    last_message_id = ack_records[-1]["message_id"]
+    status = parse_ack_status(last_ack)
+    if status == "AA":
+        st.success("\u2705 ACK Status: AA (Application Accept)")
+    elif status == "AE":
+        st.error("\u274c ACK Status: AE (Application Error)")
+    elif status == "AR":
+        st.error("\u274c ACK Status: AR (Application Reject)")
+    else:
+        st.warning(f"\u26a0\ufe0f Unknown ACK status: {status}")
+    if last_message_id:
+        st.info(f"Last sent Message Control ID (MSH-10): {last_message_id}")
 
-            st.subheader("\U0001F4C8 Metrics")
-            mcol1, mcol2 = st.columns(2)
-            mcol1.metric("Messages/sec", f"{messages_per_sec:.2f}")
-            mcol2.metric("Avg send time (ms)", f"{avg_time_ms:.2f}")
+    header_suffix = " (Last Attempt)" if rpt > 1 or num_cycles > 1 else ""
+    st.subheader(f"\U0001F4C4 Raw ACK Message{header_suffix}")
+    st.code(last_ack, language="hl7")
 
-            st.session_state["metrics_history"].append({
-                "timestamp": time.strftime("%H:%M:%S"),
-                "messages_per_sec": messages_per_sec,
-                "avg_time_ms": avg_time_ms
-            })
-            history_df = pd.DataFrame(st.session_state["metrics_history"])
-            if not history_df.empty:
-                st.line_chart(history_df.set_index("timestamp"))
+    st.subheader(f"\U0001F4C4 Parsed ACK Segments{header_suffix}")
+    segments = last_ack.strip().split("\r")
+    for segment in segments:
+        st.text(segment)
 
-        if error_message:
-            st.error(error_message)
+    if rpt > 1 or results["num_messages"] > 1 or num_cycles > 1:
+        st.subheader("\U0001F4CA ACK Summary")
+        summary_rows = build_summary_rows(ack_records, show_cycle=num_cycles > 1)
+        had_failures = any(parse_ack_status(r["ack"]) != "AA" for r in ack_records)
+        st.dataframe(summary_rows, hide_index=True, use_container_width=True, height=240)
+        if had_failures:
+            st.warning("Some ACKs indicate errors or rejects. Check the summary and raw ACK for details.")
+
+    total_attempts = len(ack_records)
+    total_elapsed = max(batch_end - results["batch_start_time"], 0)
+    messages_per_sec = (total_attempts / total_elapsed) if total_elapsed > 0 else 0
+    avg_time_ms = (sum(per_attempt_durations) / total_attempts * 1000) if total_attempts else 0
+
+    st.subheader("\U0001F4C8 Metrics")
+    mcol1, mcol2 = st.columns(2)
+    mcol1.metric("Messages/sec", f"{messages_per_sec:.2f}")
+    mcol2.metric("Avg send time (ms)", f"{avg_time_ms:.2f}")
+
+    st.session_state["metrics_history"].append({
+        "timestamp": time.strftime("%H:%M:%S"),
+        "messages_per_sec": messages_per_sec,
+        "avg_time_ms": avg_time_ms
+    })
+    history_df = pd.DataFrame(st.session_state["metrics_history"])
+    if not history_df.empty:
+        st.line_chart(history_df.set_index("timestamp"))
+
+    if results["error_message"]:
+        st.error(results["error_message"])
