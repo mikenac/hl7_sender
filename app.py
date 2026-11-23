@@ -1,5 +1,6 @@
 import streamlit as st
 import socket
+import ssl
 import json
 import os
 import time
@@ -23,25 +24,40 @@ def save_config(host, port):
     with open(CONFIG_PATH, 'w') as f:
         json.dump({'HOST': host, 'PORT': port}, f, indent=2)
 
-def send_hl7_message(message: str, host: str, port: int, timeout=10):
-    """Send HL7 message via MLLP and receive ACK."""
+def build_ssl_context(ignore_cert: bool = False):
+    """Create a client SSL context; optionally skip certificate/hostname verification."""
+    context = ssl.create_default_context()
+    if ignore_cert:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
+
+def send_hl7_message(message: str, host: str, port: int, timeout=10,
+                     use_ssl: bool = False, ignore_cert: bool = False):
+    """Send HL7 message via MLLP (optionally over TLS) and receive ACK."""
     mllp_message = MLLP_START_BLOCK + message.encode() + MLLP_END_BLOCK
 
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
-            sock.sendall(mllp_message)
-            ack_data = b''
-            while True:
-                chunk = sock.recv(1024)
-                if not chunk:
-                    break
-                ack_data += chunk
-                if MLLP_END_BLOCK in chunk:
-                    break
-        ack = ack_data.strip(MLLP_START_BLOCK + MLLP_END_BLOCK).decode()
-        return ack
+            if use_ssl:
+                context = build_ssl_context(ignore_cert)
+                with context.wrap_socket(sock, server_hostname=host) as tls_sock:
+                    return _exchange(tls_sock, mllp_message)
+            return _exchange(sock, mllp_message)
     except Exception as e:
         return f"Error: {e}"
+
+def _exchange(sock, mllp_message: bytes):
+    sock.sendall(mllp_message)
+    ack_data = b''
+    while True:
+        chunk = sock.recv(1024)
+        if not chunk:
+            break
+        ack_data += chunk
+        if MLLP_END_BLOCK in chunk:
+            break
+    return ack_data.strip(MLLP_START_BLOCK + MLLP_END_BLOCK).decode()
 
 def parse_ack_status(ack_message: str):
     """Return ACK status (AA, AE, AR) if available."""
@@ -177,6 +193,18 @@ generate_message_id = st.checkbox(
     value=True,
     help="When enabled, each send attempt gets a new MSH-10."
 )
+ssl_col1, ssl_col2 = st.columns(2)
+use_ssl = ssl_col1.checkbox(
+    "Use SSL/TLS",
+    value=False,
+    help="Wrap the MLLP connection in TLS."
+)
+ignore_cert = ssl_col2.checkbox(
+    "Ignore certificate errors",
+    value=False,
+    disabled=not use_ssl,
+    help="Skip certificate and hostname verification (e.g. self-signed certs). Only applies when SSL is enabled."
+)
 simulate_ack = st.checkbox(
     "Simulate ACK (no network send)",
     value=False,
@@ -241,7 +269,8 @@ if st.button("Send HL7 Message"):
                     if simulate_ack:
                         ack = build_fake_ack(message_to_send, message_id)
                     else:
-                        ack = send_hl7_message(message_to_send, host, int(port))
+                        ack = send_hl7_message(message_to_send, host, int(port),
+                                         use_ssl=use_ssl, ignore_cert=ignore_cert)
                     attempt_duration = time.perf_counter() - attempt_start
                     if ack.startswith("Error:"):
                         results["error_message"] = f"Cycle {cycle}, Message {msg_idx}, Attempt {attempt}: {ack}"
@@ -355,3 +384,5 @@ if results and results["ack_records"]:
 
     if results["error_message"]:
         st.error(results["error_message"])
+elif results and results["error_message"]:
+    st.error(results["error_message"])

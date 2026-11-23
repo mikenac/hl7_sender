@@ -243,3 +243,70 @@ class TestConfig:
             host, port = load_config()
         assert host == "second"
         assert port == 2222
+
+
+# ============================================================
+# SSL support
+# ============================================================
+
+class TestSsl:
+    def test_context_verifies_by_default(self):
+        import ssl
+        from app import build_ssl_context
+        ctx = build_ssl_context()
+        assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+
+    def test_context_ignore_cert(self):
+        import ssl
+        from app import build_ssl_context
+        ctx = build_ssl_context(ignore_cert=True)
+        assert ctx.verify_mode == ssl.CERT_NONE and not ctx.check_hostname
+
+    def test_send_wraps_socket_when_ssl(self):
+        tls_sock = MagicMock()
+        tls_sock.recv.side_effect = [MLLP_START_BLOCK + b"ACK" + MLLP_END_BLOCK]
+        ctx = MagicMock()
+        ctx.wrap_socket.return_value.__enter__.return_value = tls_sock
+        with patch("app.socket.create_connection"), patch("app.build_ssl_context", return_value=ctx) as b:
+            result = send_hl7_message("HELLO", "localhost", 2575, use_ssl=True, ignore_cert=True)
+        b.assert_called_once_with(True)
+        assert ctx.wrap_socket.call_args.kwargs["server_hostname"] == "localhost"
+        tls_sock.sendall.assert_called_once_with(b'\x0bHELLO\x1c\r')
+        assert result == "ACK"
+
+    def test_real_tls_roundtrip_self_signed(self, tmp_path):
+        import ssl, subprocess, threading
+        cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key),
+                        "-out", str(cert), "-days", "1", "-subj", "/CN=localhost"],
+                       check=True, capture_output=True)
+        sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        sctx.load_cert_chain(str(cert), str(key))
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0)); srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def serve():
+            conn, _ = srv.accept()
+            with sctx.wrap_socket(conn, server_side=True) as t:
+                t.recv(4096)
+                t.sendall(MLLP_START_BLOCK + b"MSA|AA|1" + MLLP_END_BLOCK)
+        th = threading.Thread(target=serve, daemon=True); th.start()
+        ok = send_hl7_message("MSH|x", "127.0.0.1", port, timeout=5, use_ssl=True, ignore_cert=True)
+        th.join(5); srv.close()
+        assert ok == "MSA|AA|1"
+
+        # Without ignore_cert the self-signed cert must be rejected
+        srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+        port = srv.getsockname()[1]
+        th = threading.Thread(target=lambda: (lambda c: c.close())(srv.accept()[0]), daemon=True)
+        def serve2():
+            conn, _ = srv.accept()
+            try:
+                sctx.wrap_socket(conn, server_side=True)
+            except Exception:
+                pass
+        th = threading.Thread(target=serve2, daemon=True); th.start()
+        bad = send_hl7_message("MSH|x", "127.0.0.1", port, timeout=5, use_ssl=True)
+        srv.close()
+        assert bad.startswith("Error:")
